@@ -1,7 +1,8 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 const BASE_VIEW = { x: 0, y: 0, width: 920, height: 760 };
 const MAX_ZOOM = 16;
-const MAP_BOUNDS = { minLon: 124.55, maxLon: 131, minLat: 33.1, maxLat: 38.75 };
+const NATIONAL_MAP_BOUNDS = { minLon: 124.55, maxLon: 131, minLat: 33.1, maxLat: 38.75 };
+const SEOUL_FALLBACK_BOUNDS = { minLon: 126.76, maxLon: 127.22, minLat: 37.40, maxLat: 37.72 };
 const MAP_FRAME = { left: 70, right: 850, top: 28, bottom: 732 };
 const LANE_OFFSET_PX = 3.2;
 const ROAD_TRACK_SPACING_PX = 14;
@@ -10,11 +11,17 @@ const NODE_RADIUS_PX = 3.6;
 const TRAVEL_HOVER_OPEN_DELAY = 120;
 const TRAVEL_HOVER_CLOSE_DELAY = 140;
 const view = { ...BASE_VIEW };
+let mapBounds = { ...NATIONAL_MAP_BOUNDS };
 const state = {
+  mode: "national",
   payload: null,
   selectedRoads: new Set(),
   roadQuery: "",
   flow: "all",
+  modeStates: {
+    national: { payload: null, selectedRoads: new Set(), roadQuery: "", view: { ...BASE_VIEW } },
+    seoul: { payload: null, selectedRoads: new Set(), roadQuery: "", view: { ...BASE_VIEW } },
+  },
   travelTimes: {
     open: false,
     groups: [],
@@ -23,13 +30,43 @@ const state = {
 };
 let panStart = null;
 let pathGeometries = [];
+let basePathSegments = [];
 let labelGeometries = [];
 let travelOpenTimer = null;
 let travelCloseTimer = null;
+let networkRequestSerial = 0;
 const travelHoverMedia = window.matchMedia("(hover: hover) and (pointer: fine)");
+
+const SPEED_SCALES = {
+  national: {
+    limits: { fast: 80, normal: 50, slow: 30, jam: 20 },
+    jamIncludesLimit: false,
+    ranges: {
+      fast: "80km/h 이상",
+      normal: "50–79km/h",
+      slow: "30–49km/h",
+      jam: "21–29km/h",
+      critical: "20km/h 이하",
+    },
+    criticalButton: "20↓",
+  },
+  seoul: {
+    limits: { fast: 50, normal: 30, slow: 20, jam: 10 },
+    jamIncludesLimit: true,
+    ranges: {
+      fast: "50km/h 이상",
+      normal: "30–49km/h",
+      slow: "20–29km/h",
+      jam: "10–19km/h",
+      critical: "10km/h 미만",
+    },
+    criticalButton: "<10",
+  },
+};
 
 const elements = {
   svg: document.querySelector("#traffic-graph"),
+  arterials: document.querySelector("#arterial-layer"),
   edges: document.querySelector("#edge-layer"),
   labels: document.querySelector("#label-layer"),
   nodes: document.querySelector("#node-layer"),
@@ -38,6 +75,8 @@ const elements = {
   roadSearch: document.querySelector("#road-search"),
   clearRoadSearch: document.querySelector("#clear-road-search"),
   roadSearchStatus: document.querySelector("#road-search-status"),
+  roadPanelTitle: document.querySelector("#road-panel-title"),
+  roadSearchLabel: document.querySelector("#road-search-label"),
   toggleRoads: document.querySelector("#toggle-roads"),
   loading: document.querySelector("#loading-state"),
   empty: document.querySelector("#empty-state"),
@@ -46,6 +85,11 @@ const elements = {
   liveState: document.querySelector("#live-state"),
   updatedAt: document.querySelector("#updated-at"),
   zoomReset: document.querySelector("#zoom-reset"),
+  graphEyebrow: document.querySelector("#graph-eyebrow"),
+  graphHeading: document.querySelector("#graph-heading"),
+  graphTitle: document.querySelector("#graph-title"),
+  graphDescription: document.querySelector("#graph-description"),
+  scopeStatus: document.querySelector("#scope-status"),
   travelDrawer: document.querySelector("#travel-time-drawer"),
   travelToggle: document.querySelector("#travel-time-toggle"),
   travelPanel: document.querySelector("#travel-time-panel"),
@@ -68,8 +112,8 @@ function mercator(lon, lat) {
 }
 
 function project(lon, lat) {
-  const southwest = mercator(MAP_BOUNDS.minLon, MAP_BOUNDS.minLat);
-  const northeast = mercator(MAP_BOUNDS.maxLon, MAP_BOUNDS.maxLat);
+  const southwest = mercator(mapBounds.minLon, mapBounds.minLat);
+  const northeast = mercator(mapBounds.maxLon, mapBounds.maxLat);
   const coordinate = mercator(lon, lat);
   const frameWidth = MAP_FRAME.right - MAP_FRAME.left;
   const frameHeight = MAP_FRAME.bottom - MAP_FRAME.top;
@@ -84,12 +128,13 @@ function project(lon, lat) {
   };
 }
 
-function speedClass(speed) {
+function speedClass(speed, mode = state.mode) {
   if (speed == null) return "unknown";
-  if (speed >= 80) return "fast";
-  if (speed >= 50) return "normal";
-  if (speed >= 30) return "slow";
-  if (speed > 20) return "jam";
+  const scale = SPEED_SCALES[mode] || SPEED_SCALES.national;
+  if (speed >= scale.limits.fast) return "fast";
+  if (speed >= scale.limits.normal) return "normal";
+  if (speed >= scale.limits.slow) return "slow";
+  if (scale.jamIncludesLimit ? speed >= scale.limits.jam : speed > scale.limits.jam) return "jam";
   return "critical";
 }
 
@@ -304,7 +349,74 @@ function projectEdgeShape(edge) {
     component.map(([lon, lat]) => project(lon, lat)));
 }
 
+function projectBaseRoad(road) {
+  return (Array.isArray(road.components) ? road.components : [])
+    .map(component => (Array.isArray(component) ? component : [])
+      .filter(coordinate => Array.isArray(coordinate) && coordinate.length >= 2)
+      .map(([lon, lat]) => project(lon, lat)))
+    .map(cleanPolyline)
+    .filter(component => component.length >= 2);
+}
+
+function componentPath(component) {
+  return component.map((point, index) =>
+    `${index ? "L" : "M"} ${point.x} ${point.y}`).join(" ");
+}
+
+function componentSegments(component) {
+  const segments = [];
+  for (let index = 0; index < component.length - 1; index += 1) {
+    segments.push({ start: component[index], end: component[index + 1] });
+  }
+  return segments;
+}
+
+function boundsForEdges(edges, fallback, baseRoadGeometries = []) {
+  let minLon = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+  const include = ([lon, lat]) => {
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
+    minLon = Math.min(minLon, lon);
+    maxLon = Math.max(maxLon, lon);
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+  };
+  edges.forEach(edge => {
+    include([edge.from.lon, edge.from.lat]);
+    include([edge.to.lon, edge.to.lat]);
+    (Array.isArray(edge.shape) ? edge.shape : []).forEach(component =>
+      (Array.isArray(component) ? component : []).forEach(include));
+  });
+  baseRoadGeometries.forEach(road =>
+    (Array.isArray(road.components) ? road.components : []).forEach(component =>
+      (Array.isArray(component) ? component : []).forEach(include)));
+  if (![minLon, maxLon, minLat, maxLat].every(Number.isFinite)) return { ...fallback };
+  const lonPadding = Math.max((maxLon - minLon) * .06, .015);
+  const latPadding = Math.max((maxLat - minLat) * .08, .012);
+  return {
+    minLon: minLon - lonPadding,
+    maxLon: maxLon + lonPadding,
+    minLat: minLat - latPadding,
+    maxLat: maxLat + latPadding,
+  };
+}
+
+function configureMapProjection(payload) {
+  mapBounds = state.mode === "seoul"
+    ? boundsForEdges(
+      payload?.edges || [], SEOUL_FALLBACK_BOUNDS, payload?.baseRoadGeometries || [],
+    )
+    : { ...NATIONAL_MAP_BOUNDS };
+  renderOutline();
+}
+
 function renderOutline() {
+  if (state.mode === "seoul") {
+    elements.outline.replaceChildren();
+    return;
+  }
   const fragment = document.createDocumentFragment();
   KOREA_BOUNDARY.forEach(polygon => {
     const paths = polygon.map(ring => ring.map(([lon, lat], index) => {
@@ -341,6 +453,8 @@ function corridorOffsets(edges) {
 
 function renderGraph() {
   if (!state.payload) return;
+  const baseRoads = (state.payload.baseRoadGeometries || [])
+    .filter(road => state.selectedRoads.has(road.roadId));
   const roadEdges = state.payload.edges.filter(edge => state.selectedRoads.has(edge.roadId));
   const networkDegrees = new Map();
   state.payload.edges.forEach(edge => {
@@ -351,13 +465,29 @@ function renderGraph() {
   });
   const unit = pixelsToMap();
   const sharedCorridorOffsets = corridorOffsets(roadEdges);
+  const baseFragment = document.createDocumentFragment();
   const edgeFragment = document.createDocumentFragment();
   const labelFragment = document.createDocumentFragment();
   const nodeFragment = document.createDocumentFragment();
   const junctions = new Map();
   pathGeometries = [];
+  basePathSegments = [];
   labelGeometries = [];
   let renderedDirections = 0;
+  let renderedBaseRoads = 0;
+
+  baseRoads.forEach(road => {
+    const components = projectBaseRoad(road);
+    if (!components.length) return;
+    const path = svgElement("path", {
+      d: components.map(componentPath).join(" "),
+      class: "arterial-base-road",
+      "data-road-id": road.roadId,
+    });
+    baseFragment.append(path);
+    basePathSegments.push(...components.flatMap(componentSegments));
+    renderedBaseRoads += 1;
+  });
 
   roadEdges.forEach(edge => {
     const start = project(edge.from.lon, edge.from.lat);
@@ -388,16 +518,21 @@ function renderGraph() {
       const group = svgElement("g", {
         class: `edge-group direction-${direction.key}`,
         tabindex: "0",
-        role: "button",
+        role: "img",
         "aria-label": `${from.name}에서 ${to.name}, ${directionText}, ${formatDuration(traffic.durationSeconds)}`,
       });
       const casing = svgElement("path", { d: geometry.d, class: "road-edge-casing" });
       const color = svgElement("path", { d: geometry.d, class: "road-edge", stroke: speedColor(traffic.speedKmh) });
       const hit = svgElement("path", { d: geometry.d, class: "road-edge-hit" });
-      group.addEventListener("pointerenter", event => showTooltip(event, edge, traffic, direction.key));
+      group.addEventListener("pointerenter", event => {
+        if (event.pointerType !== "touch") showTooltip(event, edge, traffic, direction.key);
+      });
       group.addEventListener("pointermove", moveTooltip);
       group.addEventListener("pointerleave", hideTooltip);
-      group.addEventListener("focus", event => showTooltip(event, edge, traffic, direction.key));
+      group.addEventListener("pointerdown", event => event.preventDefault());
+      group.addEventListener("focus", event => {
+        if (group.matches(":focus-visible")) showTooltip(event, edge, traffic, direction.key);
+      });
       group.addEventListener("blur", hideTooltip);
       group.append(casing, color, hit);
       edgeFragment.append(group);
@@ -440,10 +575,11 @@ function renderGraph() {
       labelFragment.append(label.group);
     });
 
+  elements.arterials.replaceChildren(baseFragment);
   elements.edges.replaceChildren(edgeFragment);
   elements.labels.replaceChildren(labelFragment);
   elements.nodes.replaceChildren(nodeFragment);
-  elements.empty.hidden = renderedDirections > 0;
+  elements.empty.hidden = renderedDirections > 0 || renderedBaseRoads > 0;
   updateZoomDependentStyles(false);
 }
 
@@ -593,7 +729,10 @@ function findPrimaryFallback(label, mapScale, occupied, segmentGrid, labelMargin
 
 function layoutLabels(zoom, unit) {
   const occupied = [];
-  const lineSegments = pathGeometries.flatMap(path => path.geometry.segments);
+  const lineSegments = [
+    ...basePathSegments,
+    ...pathGeometries.flatMap(path => path.geometry.segments),
+  ];
   const segmentGrid = buildSegmentGrid(lineSegments, Math.max(32 * unit, .01));
   const labelScreenScale = 1 + Math.min(.24, Math.log2(zoom) * .08);
   const mapScale = unit * labelScreenScale;
@@ -799,7 +938,10 @@ function scheduleTravelDrawerClose() {
   if (!travelHoverMedia.matches || !state.travelTimes.open) return;
   window.clearTimeout(travelCloseTimer);
   travelCloseTimer = window.setTimeout(() => {
-    if (!elements.travelDrawer.matches(":hover")) setTravelDrawerOpen(false);
+    if (!elements.travelDrawer.matches(":hover") &&
+      !elements.travelDrawer.contains(document.activeElement)) {
+      setTravelDrawerOpen(false);
+    }
   }, TRAVEL_HOVER_CLOSE_DELAY);
 }
 
@@ -1014,30 +1156,134 @@ function normalizeRoadQuery(value) {
   return String(value).normalize("NFKC").toLocaleLowerCase("ko-KR").replace(/\s+/g, "");
 }
 
+function listedSeoulRoadName(name) {
+  return name === "강남순환도시고속도로" ? "강남순환로" : name;
+}
+
+function prepareNetworkPayload(payload) {
+  if (payload?.mode !== "seoul" || payload.seoulArterialsPrepared ||
+    !Array.isArray(window.SEOUL_ARTERIALS)) return payload;
+
+  const naverByName = new Map();
+  payload.roads.forEach(road => naverByName.set(listedSeoulRoadName(road.name), road));
+  const usedRoadIds = new Set();
+  const baseRoadGeometries = [];
+  const roads = window.SEOUL_ARTERIALS.map((arterial, index) => {
+    const matched = naverByName.get(arterial.name);
+    if (matched) {
+      usedRoadIds.add(matched.id);
+      return {
+        ...matched,
+        name: arterial.name,
+        listedArterial: true,
+        trafficAvailable: true,
+        geometryAvailable: true,
+      };
+    }
+    const id = -(index + 1);
+    baseRoadGeometries.push({
+      roadId: id,
+      name: arterial.name,
+      components: arterial.components,
+    });
+    return {
+      id,
+      number: "간선",
+      name: arterial.name,
+      kind: "arterialRoad",
+      startName: "",
+      endName: "",
+      edgeCount: 0,
+      listedArterial: true,
+      trafficAvailable: false,
+      geometryAvailable: arterial.components.length > 0,
+    };
+  });
+
+  payload.roads.forEach(road => {
+    if (usedRoadIds.has(road.id)) return;
+    roads.push({
+      ...road,
+      listedArterial: false,
+      trafficAvailable: true,
+      geometryAvailable: true,
+    });
+  });
+  const displayNameByRoadId = new Map(
+    roads.filter(road => road.trafficAvailable).map(road => [road.id, road.name]),
+  );
+  return {
+    ...payload,
+    roads,
+    edges: payload.edges.map(edge => ({
+      ...edge,
+      roadName: displayNameByRoadId.get(edge.roadId) || edge.roadName,
+    })),
+    baseRoadGeometries,
+    seoulArterialsPrepared: true,
+  };
+}
+
+function roadKindLabel(kind) {
+  return {
+    highway: "고속도로",
+    urbanExpressway: "도시화고속도로",
+    majorRoad: "주요도로",
+    arterialRoad: "주간선도로",
+  }[kind] || "도로";
+}
+
 function roadMatchesQuery(road, query) {
   const keyword = normalizeRoadQuery(query);
   return !keyword || normalizeRoadQuery(road.name).includes(keyword) ||
-    normalizeRoadQuery(road.number).includes(keyword);
+    normalizeRoadQuery(road.number).includes(keyword) ||
+    normalizeRoadQuery(roadKindLabel(road.kind)).includes(keyword) ||
+    normalizeRoadQuery(road.listedArterial ? "주간선도로" : "").includes(keyword) ||
+    normalizeRoadQuery(road.trafficAvailable ? "교통정보 있음" : "교통정보 없음 회색").includes(keyword) ||
+    normalizeRoadQuery(road.startName).includes(keyword) ||
+    normalizeRoadQuery(road.endName).includes(keyword);
 }
 
 function renderRoadOptions(roads = state.payload?.roads || []) {
   const visibleRoads = roads.filter(road => roadMatchesQuery(road, state.roadQuery));
   elements.roadList.replaceChildren();
-  visibleRoads.forEach(road => {
+  const appendRoad = road => {
     const label = document.createElement("label");
-    label.className = "road-option";
-    label.title = road.name;
-    label.innerHTML = `<input type="checkbox" value="${road.id}" aria-label="${escapeHtml(road.name)} 표시" /><span class="route-shield">${escapeHtml(road.number)}</span><span class="road-name">${escapeHtml(road.name)}</span>`;
+    label.className = `road-option${road.trafficAvailable === false ? " is-no-traffic" : ""}`;
+    const endpoints = road.startName && road.endName ? `${road.startName} ↔ ${road.endName}` : "";
+    const status = road.trafficAvailable === false ? "교통정보 없음 · 회색 표시" : endpoints;
+    const shield = road.listedArterial && road.kind !== "urbanExpressway"
+      ? "간선" : road.number || roadKindLabel(road.kind);
+    label.title = status ? `${road.name} · ${status}` : road.name;
+    label.innerHTML = `<input type="checkbox" value="${road.id}" aria-label="${escapeHtml(road.name)} 표시" /><span class="route-shield is-${escapeHtml(road.kind || "road")}">${escapeHtml(shield)}</span><span class="road-copy"><span class="road-name">${escapeHtml(road.name)}</span>${status ? `<small class="road-endpoints">${escapeHtml(status)}</small>` : ""}</span>`;
     const input = label.querySelector("input");
     input.checked = state.selectedRoads.has(road.id);
     input.addEventListener("change", event => {
       const id = Number(event.target.value);
       event.target.checked ? state.selectedRoads.add(id) : state.selectedRoads.delete(id);
+      state.modeStates[state.mode].selectedRoads = state.selectedRoads;
       renderGraph();
       updateRoadToggleText();
     });
     elements.roadList.append(label);
-  });
+  };
+  if (state.mode === "seoul") {
+    [
+      [road => road.listedArterial && road.kind === "urbanExpressway", "도시화고속도로"],
+      [road => road.listedArterial && road.kind !== "urbanExpressway", "주간선도로"],
+      [road => !road.listedArterial, "기타 주요도로"],
+    ].forEach(([matches, label]) => {
+      const categoryRoads = visibleRoads.filter(matches);
+      if (!categoryRoads.length) return;
+      const heading = document.createElement("p");
+      heading.className = "road-category-title";
+      heading.innerHTML = `<span>${label}</span><b>${categoryRoads.length}</b>`;
+      elements.roadList.append(heading);
+      categoryRoads.forEach(appendRoad);
+    });
+  } else {
+    visibleRoads.forEach(appendRoad);
+  }
   if (!visibleRoads.length) {
     const empty = document.createElement("p");
     empty.className = "road-search-empty";
@@ -1107,49 +1353,232 @@ function resetZoom() {
   applyViewBox();
 }
 
-async function loadNetwork(force = false) {
+function modeCopy(mode = state.mode) {
+  return mode === "seoul" ? {
+    label: "서울",
+    panelTitle: "서울 도로 선택",
+    searchLabel: "서울 도로 검색",
+    searchPlaceholder: "도로명 · 시종점 검색",
+    listLabel: "서울 도시화고속도로, 주간선도로 및 기타 주요도로 목록",
+    eyebrow: "실시간 서울 네트워크",
+    heading: "서울 도시화고속도로 · 주간선도로 흐름",
+    graphTitle: "서울 도시화고속도로와 주간선도로 교통 그래프",
+    graphDescription: "서울 주간선도로 전체를 표시하고, 네이버 교통정보가 있는 구간은 평균속도별 색상으로, 없는 도로는 회색으로 표시합니다.",
+    loadingTitle: "서울 교통 흐름을 불러오는 중입니다",
+    loadingCopy: "도시화고속도로와 주간선도로를 연결하고 있어요.",
+  } : {
+    label: "전국",
+    panelTitle: "고속도로 선택",
+    searchLabel: "고속도로 노선 검색",
+    searchPlaceholder: "노선명 · 번호 검색",
+    listLabel: "전국 고속도로 목록",
+    eyebrow: "실시간 전국 네트워크",
+    heading: "전국 고속도로 흐름",
+    graphTitle: "대한민국 주요 고속도로 교통 그래프",
+    graphDescription: "주요 분기점을 정점으로, 고속도로 구간을 평균속도별 색상으로 표시합니다.",
+    loadingTitle: "전국 교통 흐름을 불러오는 중입니다",
+    loadingCopy: "주요 고속도로 구간을 연결하고 있어요.",
+  };
+}
+
+function updateSpeedScaleUi() {
+  const scale = SPEED_SCALES[state.mode] || SPEED_SCALES.national;
+  const flowLabels = {
+    fast: "원활", normal: "보통", slow: "서행", jam: "정체", critical: "극심",
+  };
+  document.querySelectorAll("[data-speed-range]").forEach(element => {
+    element.textContent = scale.ranges[element.dataset.speedRange] || "";
+  });
+  document.querySelectorAll("[data-flow]").forEach(button => {
+    const flow = button.dataset.flow;
+    if (flow === "all") return;
+    button.setAttribute("aria-label", `${flowLabels[flow]}, ${scale.ranges[flow]}`);
+    button.title = `${flowLabels[flow]} · ${scale.ranges[flow]}`;
+  });
+  document.querySelector('[data-flow="critical"]').textContent = scale.criticalButton;
+}
+
+function updateModeUi() {
+  const copy = modeCopy();
+  document.querySelectorAll("[data-mode]").forEach(button => {
+    const active = button.dataset.mode === state.mode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  elements.roadPanelTitle.textContent = copy.panelTitle;
+  elements.roadSearchLabel.textContent = copy.searchLabel;
+  elements.roadSearch.placeholder = copy.searchPlaceholder;
+  elements.roadList.setAttribute("aria-label", copy.listLabel);
+  elements.graphEyebrow.textContent = copy.eyebrow;
+  elements.graphHeading.textContent = copy.heading;
+  elements.graphTitle.textContent = copy.graphTitle;
+  elements.graphDescription.textContent = copy.graphDescription;
+  updateSpeedScaleUi();
+  if (state.mode === "seoul") setTravelDrawerOpen(false);
+  elements.travelDrawer.hidden = state.mode === "seoul";
+}
+
+function showModeLoading() {
+  const copy = modeCopy();
+  elements.loading.innerHTML = `<span></span><strong>${escapeHtml(copy.loadingTitle)}</strong><small>${escapeHtml(copy.loadingCopy)}</small>`;
+  elements.loading.hidden = false;
+}
+
+function persistCurrentModeState() {
+  const modeState = state.modeStates[state.mode];
+  modeState.payload = state.payload;
+  modeState.selectedRoads = new Set(state.selectedRoads);
+  modeState.roadQuery = state.roadQuery;
+  modeState.view = { ...view };
+}
+
+function clearRenderedNetwork() {
+  elements.arterials.replaceChildren();
+  elements.edges.replaceChildren();
+  elements.labels.replaceChildren();
+  elements.nodes.replaceChildren();
+  elements.empty.hidden = true;
+  pathGeometries = [];
+  basePathSegments = [];
+  labelGeometries = [];
+  hideTooltip();
+}
+
+function applyNetworkPayload(rawPayload) {
+  const payload = prepareNetworkPayload(rawPayload);
+  const modeState = state.modeStates[state.mode];
+  const previousRoads = modeState.payload?.roads || [];
+  const previousSelection = modeState.selectedRoads;
+  const previouslyAllSelected = previousRoads.length > 0 &&
+    previousRoads.every(road => previousSelection.has(road.id));
+  const incomingIds = new Set(payload.roads.map(road => road.id));
+  const selectedRoads = !modeState.payload || previouslyAllSelected
+    ? new Set(incomingIds)
+    : new Set([...previousSelection].filter(id => incomingIds.has(id)));
+
+  modeState.payload = payload;
+  modeState.selectedRoads = selectedRoads;
+  state.payload = payload;
+  state.selectedRoads = selectedRoads;
+  configureMapProjection(payload);
+  applyViewBox(false);
+  renderRoadOptions(payload.roads);
+  updateRoadToggleText();
+  renderGraph();
+  updateTravelTimePanel(payload);
+  elements.updatedAt.textContent = new Date(payload.updatedAt * 1000)
+    .toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  elements.liveState.lastElementChild.textContent = payload.partial ? "일부 노선 연결" : "실시간 연결됨";
+  elements.loading.hidden = true;
+  elements.roadSearch.disabled = false;
+  elements.toggleRoads.disabled = false;
+  elements.scopeStatus.textContent = `${modeCopy().label} ${payload.roads.length}개 도로를 표시했습니다.`;
+}
+
+function setMode(mode) {
+  if (!state.modeStates[mode] || mode === state.mode) return;
+  persistCurrentModeState();
+  networkRequestSerial += 1;
+  setTravelDrawerOpen(false);
+  clearRenderedNetwork();
+  state.mode = mode;
+  const modeState = state.modeStates[mode];
+  state.payload = modeState.payload;
+  state.selectedRoads = new Set(modeState.selectedRoads);
+  modeState.selectedRoads = state.selectedRoads;
+  state.roadQuery = modeState.roadQuery;
+  elements.roadSearch.value = state.roadQuery;
+  Object.assign(view, modeState.view);
+  state.flow = "all";
+  document.querySelectorAll("[data-flow]").forEach(button => {
+    const active = button.dataset.flow === "all";
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  updateModeUi();
+
+  if (modeState.payload) {
+    applyNetworkPayload(modeState.payload);
+    loadNetwork(false, false);
+  } else {
+    mapBounds = mode === "seoul" ? { ...SEOUL_FALLBACK_BOUNDS } : { ...NATIONAL_MAP_BOUNDS };
+    renderOutline();
+    applyViewBox(false);
+    elements.roadList.replaceChildren();
+    elements.roadSearch.disabled = true;
+    elements.toggleRoads.disabled = true;
+    elements.clearRoadSearch.hidden = !state.roadQuery;
+    elements.roadSearchStatus.textContent = `${modeCopy().label} 도로를 불러오는 중`;
+    updateTravelTimePanel({ travelCorridors: [] });
+    showModeLoading();
+    loadNetwork();
+  }
+}
+
+async function loadNetwork(force = false, showLoading = true) {
+  const requestMode = state.mode;
+  const requestSerial = ++networkRequestSerial;
+  if (showLoading) showModeLoading();
   elements.refresh.classList.add("is-loading");
   elements.liveState.classList.remove("is-error");
   elements.liveState.lastElementChild.textContent = "실시간 연결 중";
   try {
-    const response = await fetch(`/api/network${force ? "?refresh=true" : ""}`, { cache: "no-store" });
+    const query = new URLSearchParams({ mode: requestMode });
+    if (force) query.set("refresh", "true");
+    const response = await fetch(`/api/network?${query}`, { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "교통정보를 불러오지 못했습니다.");
-    const previousRoads = state.payload?.roads || [];
-    const previouslyAllSelected = previousRoads.length > 0 &&
-      previousRoads.every(road => state.selectedRoads.has(road.id));
-    const incomingIds = new Set(payload.roads.map(road => road.id));
-    state.selectedRoads = !state.payload || previouslyAllSelected
-      ? new Set(incomingIds)
-      : new Set([...state.selectedRoads].filter(id => incomingIds.has(id)));
-    state.payload = payload;
-    renderRoadOptions(payload.roads);
-    updateRoadToggleText();
-    renderGraph();
-    updateTravelTimePanel(payload);
-    elements.updatedAt.textContent = new Date(payload.updatedAt * 1000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
-    elements.liveState.lastElementChild.textContent = payload.partial ? "일부 노선 연결" : "실시간 연결됨";
-    elements.loading.hidden = true;
-    elements.roadSearch.disabled = false;
-    elements.toggleRoads.disabled = false;
+    if (payload.mode && payload.mode !== requestMode) {
+      throw new Error("요청한 지도 범위와 다른 교통정보를 받았습니다.");
+    }
+    if (requestSerial !== networkRequestSerial) return;
+    if (requestMode !== state.mode) {
+      const modeState = state.modeStates[requestMode];
+      if (!modeState.payload) {
+        modeState.selectedRoads = new Set(payload.roads.map(road => road.id));
+      }
+      modeState.payload = payload;
+      return;
+    }
+    applyNetworkPayload(payload);
   } catch (error) {
+    if (requestMode !== state.mode || requestSerial !== networkRequestSerial) return;
+    if (state.payload) {
+      elements.loading.hidden = true;
+      elements.liveState.classList.add("is-error");
+      elements.liveState.lastElementChild.textContent = "갱신 실패 · 저장 정보 표시";
+      elements.scopeStatus.textContent = `${modeCopy().label} 교통정보 갱신에 실패해 저장된 정보를 표시합니다.`;
+      return;
+    }
     elements.loading.innerHTML = `<strong>교통정보를 불러오지 못했습니다</strong><small>${escapeHtml(error.message)}</small>`;
     elements.liveState.classList.add("is-error");
     elements.liveState.lastElementChild.textContent = "연결 오류";
   } finally {
-    elements.refresh.classList.remove("is-loading");
+    if (requestMode === state.mode && requestSerial === networkRequestSerial) {
+      elements.refresh.classList.remove("is-loading");
+    }
   }
 }
 
 document.querySelectorAll("[data-flow]").forEach(button => button.addEventListener("click", () => {
-  document.querySelectorAll("[data-flow]").forEach(item => item.classList.toggle("is-active", item === button));
+  document.querySelectorAll("[data-flow]").forEach(item => {
+    const active = item === button;
+    item.classList.toggle("is-active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
   state.flow = button.dataset.flow;
   renderGraph();
 }));
 
+document.querySelectorAll("[data-mode]").forEach(button => button.addEventListener("click", () => {
+  setMode(button.dataset.mode);
+}));
+
 elements.toggleRoads.addEventListener("click", () => {
+  if (!state.payload) return;
   const allSelected = state.payload.roads.every(road => state.selectedRoads.has(road.id));
   state.selectedRoads = new Set(allSelected ? [] : state.payload.roads.map(road => road.id));
+  state.modeStates[state.mode].selectedRoads = state.selectedRoads;
   renderRoadOptions();
   updateRoadToggleText();
   renderGraph();
@@ -1157,22 +1586,20 @@ elements.toggleRoads.addEventListener("click", () => {
 
 elements.roadSearch.addEventListener("input", event => {
   state.roadQuery = event.target.value;
+  state.modeStates[state.mode].roadQuery = state.roadQuery;
   renderRoadOptions();
 });
 
 elements.clearRoadSearch.addEventListener("click", () => {
   state.roadQuery = "";
+  state.modeStates[state.mode].roadQuery = "";
   elements.roadSearch.value = "";
   renderRoadOptions();
   elements.roadSearch.focus();
 });
 
-elements.travelToggle.addEventListener("click", event => {
-  if (!travelHoverMedia.matches || event.detail === 0) {
-    setTravelDrawerOpen(!state.travelTimes.open);
-  } else {
-    setTravelDrawerOpen(true);
-  }
+elements.travelToggle.addEventListener("click", () => {
+  setTravelDrawerOpen(!state.travelTimes.open);
 });
 
 elements.travelDrawer.addEventListener("pointerenter", scheduleTravelDrawerOpen);
@@ -1203,7 +1630,7 @@ document.addEventListener("keydown", event => {
   closeTravelDrawerAndRestoreFocus();
 });
 
-elements.refresh.addEventListener("click", () => loadNetwork(true));
+elements.refresh.addEventListener("click", () => loadNetwork(true, false));
 document.querySelector("#zoom-in").addEventListener("click", () => zoomBy(.78));
 document.querySelector("#zoom-out").addEventListener("click", () => zoomBy(1.28));
 elements.zoomReset.addEventListener("click", resetZoom);
@@ -1215,7 +1642,6 @@ elements.svg.addEventListener("wheel", event => {
 
 elements.svg.addEventListener("pointerdown", event => {
   if (event.button !== 0) return;
-  if (event.target.closest(".edge-group")) return;
   panStart = {
     clientX: event.clientX,
     clientY: event.clientY,
@@ -1251,6 +1677,7 @@ window.addEventListener("resize", () => {
   else updateZoomDependentStyles();
 });
 
+updateModeUi();
 renderOutline();
 applyViewBox();
 loadNetwork();

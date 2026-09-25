@@ -4,23 +4,24 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#07100e" />
-    <meta name="description" content="대한민국 주요 고속도로의 실시간 소요시간과 평균속도를 그래프로 확인합니다." />
-    <meta property="og:title" content="대한민국 고속도로 흐름도" />
-    <meta property="og:description" content="주요 분기점 사이의 실시간 소요시간과 평균속도를 한눈에 확인하세요." />
+    <meta name="description" content="전국 고속도로와 서울 도시화고속도로·주간선도로의 실시간 교통 흐름을 그래프로 확인합니다." />
+    <meta property="og:title" content="대한민국 주요도로 교통 흐름도" />
+    <meta property="og:description" content="전국 고속도로와 서울 주간선도로의 실시간 교통 흐름을 한눈에 확인하세요." />
     <meta property="og:image" content="/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="대한민국 고속도로 흐름도" />
-    <meta name="twitter:description" content="주요 분기점 사이의 실시간 소요시간과 평균속도를 한눈에 확인하세요." />
+    <meta name="twitter:title" content="대한민국 주요도로 교통 흐름도" />
+    <meta name="twitter:description" content="전국 고속도로와 서울 주간선도로의 실시간 교통 흐름을 한눈에 확인하세요." />
     <meta name="twitter:image" content="/og.png" />
-    <title>대한민국 고속도로 흐름도</title>
+    <title>대한민국 주요도로 교통 흐름도</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="/korea-boundary.js" defer></script>
+    <script src="/seoul-arterials.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
     <div class="page-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="대한민국 고속도로 흐름도 홈">
+        <a class="brand" href="/" aria-label="대한민국 주요도로 교통 흐름도 홈">
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
           <span>ROAD<span>FLOW</span></span>
         </a>
@@ -34,12 +35,19 @@
       </header>
 
       <main>
+        <div class="scope-bar">
+          <div class="scope-switch" role="group" aria-label="교통 지도 범위">
+            <button class="is-active" data-mode="national" type="button" aria-pressed="true"><strong>전국</strong><small>고속도로</small></button>
+            <button data-mode="seoul" type="button" aria-pressed="false"><strong>서울</strong><small>도시화고속도로 · 주간선도로</small></button>
+          </div>
+          <p class="sr-only" id="scope-status" role="status" aria-live="polite"></p>
+        </div>
         <section class="workspace">
           <aside class="control-panel" aria-label="그래프 필터">
             <div class="panel-block">
-              <div class="panel-title-row"><h2>노선 선택</h2><button id="toggle-roads" type="button" disabled>전체 해제</button></div>
+              <div class="panel-title-row"><h2 id="road-panel-title">고속도로 선택</h2><button id="toggle-roads" type="button" disabled>전체 해제</button></div>
               <div class="road-search-wrap">
-                <label class="sr-only" for="road-search">고속도로 노선 검색</label>
+                <label class="sr-only" id="road-search-label" for="road-search">고속도로 노선 검색</label>
                 <input id="road-search" type="search" placeholder="노선명 · 번호 검색" autocomplete="off" aria-controls="road-list" disabled />
                 <button id="clear-road-search" type="button" aria-label="노선 검색어 지우기" hidden>×</button>
               </div>
@@ -51,11 +59,11 @@
             <div class="panel-block legend-block">
               <h2>평균속도 범례</h2>
               <ul class="legend">
-                <li><i class="flow-fast"></i><span>원활</span><b>80km/h 이상</b></li>
-                <li><i class="flow-normal"></i><span>보통</span><b>50–79km/h</b></li>
-                <li><i class="flow-slow"></i><span>서행</span><b>30–49km/h</b></li>
-                <li><i class="flow-jam"></i><span>정체</span><b>21–29km/h</b></li>
-                <li><i class="flow-critical"></i><span>극심</span><b>20km/h 이하</b></li>
+                <li><i class="flow-fast"></i><span>원활</span><b data-speed-range="fast">80km/h 이상</b></li>
+                <li><i class="flow-normal"></i><span>보통</span><b data-speed-range="normal">50–79km/h</b></li>
+                <li><i class="flow-slow"></i><span>서행</span><b data-speed-range="slow">30–49km/h</b></li>
+                <li><i class="flow-jam"></i><span>정체</span><b data-speed-range="jam">21–29km/h</b></li>
+                <li><i class="flow-critical"></i><span>극심</span><b data-speed-range="critical">20km/h 이하</b></li>
               </ul>
             </div>
           </aside>
@@ -63,17 +71,17 @@
           <div class="graph-panel">
             <div class="graph-toolbar">
               <div>
-                <p>실시간 네트워크</p><h2>전국 고속도로 흐름</h2>
+                <p id="graph-eyebrow">실시간 전국 네트워크</p><h2 id="graph-heading">전국 고속도로 흐름</h2>
                 <span class="dual-direction-note"><i></i> 상·하행 동시 표시</span>
               </div>
               <div class="graph-actions">
                 <div class="flow-filters" role="group" aria-label="소통 상태 필터">
-                  <button class="is-active" data-flow="all" type="button">전체</button>
-                  <button data-flow="fast" type="button">원활</button>
-                  <button data-flow="normal" type="button">보통</button>
-                  <button data-flow="slow" type="button">서행</button>
-                  <button data-flow="jam" type="button">정체</button>
-                  <button data-flow="critical" type="button">20↓</button>
+                  <button class="is-active" data-flow="all" type="button" aria-pressed="true">전체</button>
+                  <button data-flow="fast" type="button" aria-pressed="false">원활</button>
+                  <button data-flow="normal" type="button" aria-pressed="false">보통</button>
+                  <button data-flow="slow" type="button" aria-pressed="false">서행</button>
+                  <button data-flow="jam" type="button" aria-pressed="false">정체</button>
+                  <button data-flow="critical" type="button" aria-pressed="false">20↓</button>
                 </div>
                 <div class="zoom-controls" role="group" aria-label="지도 확대 축소">
                   <button id="zoom-out" type="button" aria-label="축소">−</button>
@@ -84,7 +92,7 @@
             </div>
             <div class="graph-stage" id="graph-stage">
               <div class="loading-state" id="loading-state"><span></span><strong>전국 교통 흐름을 불러오는 중입니다</strong><small>주요 고속도로 구간을 연결하고 있어요.</small></div>
-              <svg id="traffic-graph" viewBox="0 0 920 760" role="img" aria-labelledby="graph-title graph-description">
+              <svg id="traffic-graph" viewBox="0 0 920 760" role="group" aria-labelledby="graph-title graph-description">
                 <title id="graph-title">대한민국 주요 고속도로 교통 그래프</title>
                 <desc id="graph-description">주요 분기점을 정점으로, 고속도로 구간을 평균속도별 색상으로 표시합니다.</desc>
                 <defs>
@@ -92,7 +100,7 @@
                   <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M 32 0 L 0 0 0 32" fill="none" stroke="rgba(255,255,255,.035)" stroke-width="1" /></pattern>
                 </defs>
                 <rect width="920" height="760" fill="url(#grid)"></rect>
-                <g id="map-outline" aria-hidden="true"></g><g id="edge-layer"></g><g id="node-layer"></g><g id="label-layer"></g>
+                <g id="map-outline" aria-hidden="true"></g><g id="arterial-layer" aria-hidden="true"></g><g id="edge-layer"></g><g id="node-layer"></g><g id="label-layer"></g>
               </svg>
               <div class="tooltip" id="tooltip" hidden></div>
               <div class="empty-state" id="empty-state" hidden><strong>표시할 구간이 없습니다</strong><span>노선이나 소통 상태 필터를 바꿔보세요.</span></div>
@@ -102,8 +110,8 @@
         </section>
 
         <section class="data-note">
-          <p><strong>데이터 안내</strong>구간 평균속도는 네이버지도 교통정보의 거리와 현재 소요시간으로 계산합니다. 경계 데이터는 geoBoundaries gbOpen(CC BY 4.0)을 사용합니다.</p>
-          <a href="https://rtt.map.naver.com/end-traffic/ends/web/home" target="_blank" rel="noreferrer">원본 교통정보 보기 ↗</a>
+          <p><strong>데이터 안내</strong>구간 평균속도는 네이버지도 교통정보의 거리와 현재 소요시간으로 계산합니다. 서울 주간선도로는 모두 표시하며, 네이버 교통정보가 없는 도로는 회색으로 표시합니다. 기본 선형은 OpenStreetMap(ODbL), 경계는 geoBoundaries gbOpen(CC BY 4.0)을 사용합니다.</p>
+          <span class="data-links"><a href="https://rtt.map.naver.com/end-traffic/ends/web/home" target="_blank" rel="noreferrer">원본 교통정보 ↗</a><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors ↗</a></span>
         </section>
       </main>
 

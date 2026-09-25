@@ -25,6 +25,7 @@ const NAVER_ROAD_CATALOG_API: &str =
     "https://rtt.map.naver.com/end-traffic/api/traffic-dist/road_group";
 const CACHE_TTL: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_REQUESTS: usize = 10;
+const SEOUL_TRAFFIC_EXTENSION_IDS: [u32; 5] = [10002, 40266, 40976, 60001, 60032];
 
 const CORE_ROADS: &[(u32, &str, &str)] = &[
     (10002, "1", "경부고속도로"),
@@ -39,19 +40,95 @@ const CORE_ROADS: &[(u32, &str, &str)] = &[
     (10001, "12", "광주대구고속도로"),
 ];
 
+const SEOUL_ROADS: &[(u32, &str, &str, RoadKind)] = &[
+    (10002, "1", "경부간선도로", RoadKind::MajorRoad),
+    (20003, "70", "강변북로", RoadKind::UrbanExpressway),
+    (20007, "30", "내부순환로", RoadKind::UrbanExpressway),
+    (20008, "61", "동부간선도로", RoadKind::UrbanExpressway),
+    (20011, "44", "북부간선도로", RoadKind::UrbanExpressway),
+    (20014, "55", "서부간선도로", RoadKind::UrbanExpressway),
+    (20017, "88", "올림픽대로", RoadKind::UrbanExpressway),
+    (
+        20025,
+        "94",
+        "강남순환도시고속도로",
+        RoadKind::UrbanExpressway,
+    ),
+    (40026, "주요", "강남대로", RoadKind::MajorRoad),
+    (40028, "주요", "강동대로", RoadKind::MajorRoad),
+    (40060, "주요", "경인로", RoadKind::MajorRoad),
+    (40086, "주요", "공항대로", RoadKind::MajorRoad),
+    (40093, "주요", "관악로", RoadKind::MajorRoad),
+    (40167, "주요", "남대문로", RoadKind::MajorRoad),
+    (40169, "주요", "남부순환로", RoadKind::MajorRoad),
+    (40178, "주요", "노들로", RoadKind::MajorRoad),
+    (40252, "주요", "도산대로", RoadKind::MajorRoad),
+    (40262, "주요", "돈화문로", RoadKind::MajorRoad),
+    (40266, "주요", "동일로", RoadKind::MajorRoad),
+    (40282, "주요", "동소문로", RoadKind::MajorRoad),
+    (40288, "주요", "동작대로", RoadKind::MajorRoad),
+    (40382, "주요", "반포대로", RoadKind::MajorRoad),
+    (40440, "주요", "봉은사로", RoadKind::MajorRoad),
+    (40449, "주요", "북악산로", RoadKind::MajorRoad),
+    (40482, "주요", "삼성로", RoadKind::MajorRoad),
+    (40484, "주요", "삼일대로", RoadKind::MajorRoad),
+    (40504, "주요", "새문안로", RoadKind::MajorRoad),
+    (40557, "주요", "성산로", RoadKind::MajorRoad),
+    (40570, "주요", "세종대로", RoadKind::MajorRoad),
+    (40588, "3", "송파대로", RoadKind::MajorRoad),
+    (40620, "주요", "시흥대로", RoadKind::MajorRoad),
+    (40662, "주요", "안양천로", RoadKind::MajorRoad),
+    (40672, "주요", "양재대로", RoadKind::MajorRoad),
+    (40682, "주요", "언주로", RoadKind::MajorRoad),
+    (40709, "주요", "영동대로", RoadKind::MajorRoad),
+    (40767, "주요", "원효로", RoadKind::MajorRoad),
+    (40782, "주요", "율곡로", RoadKind::MajorRoad),
+    (40787, "주요", "을지로", RoadKind::MajorRoad),
+    (40855, "주요", "국회대로", RoadKind::MajorRoad),
+    (40919, "주요", "천호대로", RoadKind::MajorRoad),
+    (40924, "주요", "청계천로", RoadKind::MajorRoad),
+    (40946, "주요", "충정로", RoadKind::MajorRoad),
+    (40969, "주요", "테헤란로", RoadKind::MajorRoad),
+    (40976, "주요", "통일로", RoadKind::MajorRoad),
+    (40978, "주요", "퇴계로", RoadKind::MajorRoad),
+    (41004, "주요", "한강대로", RoadKind::MajorRoad),
+    (41032, "주요", "헌릉로", RoadKind::MajorRoad),
+    (41047, "주요", "화랑로", RoadKind::MajorRoad),
+    (60001, "교량", "가양대교", RoadKind::MajorRoad),
+    (60032, "교량", "한강대교", RoadKind::MajorRoad),
+];
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum NetworkMode {
+    #[default]
+    National,
+    Seoul,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum RoadKind {
+    Highway,
+    UrbanExpressway,
+    MajorRoad,
+}
+
 #[derive(Clone, Debug)]
 struct RoadSpec {
     id: u32,
     number: String,
     name: String,
+    kind: RoadKind,
 }
 
 impl RoadSpec {
-    fn new(id: u32, number: impl Into<String>, name: impl Into<String>) -> Self {
+    fn new(id: u32, number: impl Into<String>, name: impl Into<String>, kind: RoadKind) -> Self {
         Self {
             id,
             number: number.into(),
             name: name.into(),
+            kind,
         }
     }
 }
@@ -59,7 +136,8 @@ impl RoadSpec {
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    cache: Arc<RwLock<Option<CachedNetwork>>>,
+    cache: Arc<RwLock<HashMap<NetworkMode, CachedNetwork>>>,
+    request_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -102,6 +180,10 @@ struct NaverRoadCatalogItem {
     number: u32,
     road_type: String,
     seq: u32,
+    #[serde(default)]
+    si: Option<String>,
+    #[serde(default)]
+    si_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +192,8 @@ struct NaverRoad {
     id: u32,
     number: u32,
     road_name: String,
+    st_point_name: String,
+    ed_point_name: String,
     st_goal_area: String,
     ed_goal_area: String,
 }
@@ -165,6 +249,7 @@ struct NaverTraffic {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NetworkPayload {
+    mode: NetworkMode,
     updated_at: u64,
     source: &'static str,
     source_url: &'static str,
@@ -183,6 +268,9 @@ struct RoadSummary {
     id: u32,
     number: String,
     name: String,
+    kind: RoadKind,
+    start_name: String,
+    end_name: String,
     edge_count: usize,
 }
 
@@ -248,6 +336,8 @@ struct TravelSection {
 #[derive(Deserialize, Default)]
 struct NetworkQuery {
     refresh: Option<bool>,
+    #[serde(default)]
+    mode: NetworkMode,
 }
 
 #[tokio::main]
@@ -261,12 +351,14 @@ async fn main() {
 
     let state = AppState {
         client,
-        cache: Arc::new(RwLock::new(None)),
+        cache: Arc::new(RwLock::new(HashMap::new())),
+        request_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
     };
     let app = Router::new()
         .route("/", get(index))
         .route("/styles.css", get(styles))
         .route("/korea-boundary.js", get(korea_boundary))
+        .route("/seoul-arterials.js", get(seoul_arterials))
         .route("/app.js", get(script))
         .route("/og.png", get(social_preview))
         .route("/api/network", get(network))
@@ -302,6 +394,13 @@ async fn script() -> impl IntoResponse {
     )
 }
 
+async fn seoul_arterials() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/seoul-arterials.js"),
+    )
+}
+
 async fn korea_boundary() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
@@ -327,24 +426,30 @@ async fn network(
     let force_refresh = query.refresh.unwrap_or(false);
     if !force_refresh {
         let cache = state.cache.read().await;
-        if let Some(cached) = cache.as_ref()
+        if let Some(cached) = cache.get(&query.mode)
             && cached.stored_at.elapsed().unwrap_or(CACHE_TTL) < CACHE_TTL
         {
             return Ok(Json(cached.payload.clone()));
         }
     }
-    let payload = fetch_network(&state.client).await?;
-    *state.cache.write().await = Some(CachedNetwork {
-        stored_at: SystemTime::now(),
-        payload: payload.clone(),
-    });
+    let payload = fetch_network(&state.client, state.request_slots.clone(), query.mode).await?;
+    state.cache.write().await.insert(
+        query.mode,
+        CachedNetwork {
+            stored_at: SystemTime::now(),
+            payload: payload.clone(),
+        },
+    );
     Ok(Json(payload))
 }
 
-async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
-    let (road_specs, catalog_fallback) = fetch_road_specs(client).await;
+async fn fetch_network(
+    client: &Client,
+    request_slots: Arc<Semaphore>,
+    mode: NetworkMode,
+) -> Result<NetworkPayload, ApiError> {
+    let (road_specs, catalog_fallback) = fetch_road_specs(client, mode).await;
     let mut requests = JoinSet::new();
-    let request_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     for spec in road_specs.iter().cloned() {
         let client = client.clone();
         let request_slots = request_slots.clone();
@@ -372,14 +477,19 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
         if let Ok(Ok((spec, response))) = result {
             let NaverRoadResponse {
                 road,
-                groups,
+                mut groups,
                 sections,
             } = response;
-            let road_name = if road.road_name.is_empty() {
-                spec.name.clone()
-            } else {
-                road.road_name.clone()
-            };
+            groups.retain(|group| include_traffic_group(mode, road.id, &group.grp_code));
+            if groups.is_empty() {
+                continue;
+            }
+            let road_name =
+                if (mode == NetworkMode::Seoul && road.id == 10002) || road.road_name.is_empty() {
+                    spec.name.clone()
+                } else {
+                    road.road_name.clone()
+                };
             let road_number = if road.number == 0 {
                 spec.number.clone()
             } else {
@@ -412,6 +522,14 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
                     .or_default()
                     .push(section);
             }
+            let start_name = groups
+                .first()
+                .map(|group| group.st_name.clone())
+                .unwrap_or_else(|| road.st_point_name.clone());
+            let end_name = groups
+                .last()
+                .map(|group| group.ed_name.clone())
+                .unwrap_or_else(|| road.ed_point_name.clone());
             let edge_count = groups.len();
             for group in groups {
                 let distance_km = group.distance as f64 / 1000.0;
@@ -446,6 +564,9 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
                 id: road.id,
                 number: road_number,
                 name: road_name,
+                kind: spec.kind,
+                start_name,
+                end_name,
                 edge_count,
             });
         }
@@ -458,8 +579,14 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
     }
     roads.sort_by_key(|road| road.id);
     edges.sort_by(|a, b| a.road_id.cmp(&b.road_id).then(a.id.cmp(&b.id)));
-    canonicalize_junctions(&mut edges);
-    let travel_corridors = build_travel_corridors(&travel_sections_by_road);
+    if mode == NetworkMode::National {
+        canonicalize_junctions(&mut edges);
+    }
+    let travel_corridors = if mode == NetworkMode::National {
+        build_travel_corridors(&travel_sections_by_road)
+    } else {
+        Vec::new()
+    };
     let loaded_ids: HashSet<_> = roads.iter().map(|road| road.id).collect();
     let mut failed_roads = road_specs
         .iter()
@@ -467,10 +594,18 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
         .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
     if catalog_fallback {
-        failed_roads.insert(0, "전체 고속도로 목록".to_owned());
+        failed_roads.insert(
+            0,
+            match mode {
+                NetworkMode::National => "전체 고속도로 목록",
+                NetworkMode::Seoul => "서울 도로 목록",
+            }
+            .to_owned(),
+        );
     }
 
     Ok(NetworkPayload {
+        mode,
         updated_at: unix_now(),
         source: "네이버지도 실시간 교통정보",
         source_url: NAVER_HOME,
@@ -484,7 +619,70 @@ async fn fetch_network(client: &Client) -> Result<NetworkPayload, ApiError> {
     })
 }
 
-async fn fetch_road_specs(client: &Client) -> (Vec<RoadSpec>, bool) {
+fn include_traffic_group(mode: NetworkMode, road_id: u32, group_code: &str) -> bool {
+    if mode != NetworkMode::Seoul {
+        return true;
+    }
+    match road_id {
+        10002 => group_code == "1000201D",
+        40266 => group_code != "4026601D",
+        _ => true,
+    }
+}
+
+fn catalog_road_kind(road: &NaverRoadCatalogItem, mode: NetworkMode) -> Option<RoadKind> {
+    match mode {
+        NetworkMode::National if road.road_type == "HIGHWAY" => Some(RoadKind::Highway),
+        NetworkMode::Seoul if SEOUL_TRAFFIC_EXTENSION_IDS.contains(&road.seq) => {
+            Some(RoadKind::MajorRoad)
+        }
+        NetworkMode::Seoul
+            if road.si.as_deref() == Some("서울") || road.si_code.as_deref() == Some("11000") =>
+        {
+            match road.road_type.as_str() {
+                "EXPRESSWAY" => Some(RoadKind::UrbanExpressway),
+                "ROAD" => Some(RoadKind::MajorRoad),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn catalog_road_name(road: &NaverRoadCatalogItem, mode: NetworkMode) -> &str {
+    if mode == NetworkMode::Seoul && road.seq == 10002 {
+        "경부간선도로"
+    } else {
+        &road.name
+    }
+}
+
+fn catalog_road_number(road: &NaverRoadCatalogItem, kind: RoadKind) -> String {
+    if road.number > 0 {
+        return road.number.to_string();
+    }
+    match kind {
+        RoadKind::Highway => "–",
+        RoadKind::UrbanExpressway => "도시",
+        RoadKind::MajorRoad => "주요",
+    }
+    .to_owned()
+}
+
+fn fallback_road_specs(mode: NetworkMode) -> Vec<RoadSpec> {
+    match mode {
+        NetworkMode::National => CORE_ROADS
+            .iter()
+            .map(|(id, number, name)| RoadSpec::new(*id, *number, *name, RoadKind::Highway))
+            .collect(),
+        NetworkMode::Seoul => SEOUL_ROADS
+            .iter()
+            .map(|(id, number, name, kind)| RoadSpec::new(*id, *number, *name, *kind))
+            .collect(),
+    }
+}
+
+async fn fetch_road_specs(client: &Client, mode: NetworkMode) -> (Vec<RoadSpec>, bool) {
     let response = client
         .get(NAVER_ROAD_CATALOG_API)
         .header(reqwest::header::REFERER, NAVER_HOME)
@@ -500,8 +698,15 @@ async fn fetch_road_specs(client: &Client) -> (Vec<RoadSpec>, bool) {
             .road_list
             .into_iter()
             .flat_map(|bucket| bucket.road)
-            .filter(|road| road.road_type == "HIGHWAY" && road.seq > 0)
-            .map(|road| RoadSpec::new(road.seq, road.number.to_string(), road.name))
+            .filter_map(|road| {
+                if road.seq == 0 {
+                    return None;
+                }
+                let kind = catalog_road_kind(&road, mode)?;
+                let number = catalog_road_number(&road, kind);
+                let name = catalog_road_name(&road, mode).to_owned();
+                Some(RoadSpec::new(road.seq, number, name, kind))
+            })
             .collect::<Vec<_>>();
         roads.sort_by_key(|road| road.id);
         roads.dedup_by_key(|road| road.id);
@@ -510,13 +715,7 @@ async fn fetch_road_specs(client: &Client) -> (Vec<RoadSpec>, bool) {
         }
     }
 
-    (
-        CORE_ROADS
-            .iter()
-            .map(|(id, number, name)| RoadSpec::new(*id, *number, *name))
-            .collect(),
-        true,
-    )
+    (fallback_road_specs(mode), true)
 }
 
 type TravelLeg<'a> = (u32, &'a str, &'a str);
@@ -1545,6 +1744,127 @@ mod tests {
         assert!(is_major_junction("안성JC"));
         assert!(is_major_junction("소흘분기점"));
         assert!(!is_major_junction("수원IC"));
+    }
+
+    fn catalog_item(
+        road_type: &str,
+        city: Option<&str>,
+        city_code: Option<&str>,
+    ) -> NaverRoadCatalogItem {
+        NaverRoadCatalogItem {
+            name: "테스트도로".to_owned(),
+            number: 0,
+            road_type: road_type.to_owned(),
+            seq: 1,
+            si: city.map(str::to_owned),
+            si_code: city_code.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn selects_naver_roads_for_each_network_mode() {
+        let highway = catalog_item("HIGHWAY", None, None);
+        let urban = catalog_item("EXPRESSWAY", Some("서울"), Some("11000"));
+        let major = catalog_item("ROAD", Some("서울"), Some("11000"));
+        let tunnel = catalog_item("TUNNEL", Some("서울"), Some("11000"));
+        let gyeonggi = catalog_item("ROAD", Some("경기"), Some("41000"));
+        let mut bridge = catalog_item("LARGE_BRIDGE", Some("서울"), Some("11000"));
+        bridge.seq = 60001;
+        bridge.name = "가양대교".to_owned();
+        let mut extended_gyeonggi = catalog_item("ROAD", Some("경기"), Some("41000"));
+        extended_gyeonggi.seq = 40266;
+        extended_gyeonggi.name = "동일로".to_owned();
+
+        assert_eq!(
+            catalog_road_kind(&highway, NetworkMode::National),
+            Some(RoadKind::Highway)
+        );
+        assert_eq!(catalog_road_kind(&highway, NetworkMode::Seoul), None);
+        assert_eq!(
+            catalog_road_kind(&urban, NetworkMode::Seoul),
+            Some(RoadKind::UrbanExpressway)
+        );
+        assert_eq!(
+            catalog_road_kind(&major, NetworkMode::Seoul),
+            Some(RoadKind::MajorRoad)
+        );
+        assert_eq!(catalog_road_kind(&tunnel, NetworkMode::Seoul), None);
+        assert_eq!(catalog_road_kind(&gyeonggi, NetworkMode::Seoul), None);
+        assert_eq!(
+            catalog_road_kind(&bridge, NetworkMode::Seoul),
+            Some(RoadKind::MajorRoad)
+        );
+        assert_eq!(
+            catalog_road_kind(&extended_gyeonggi, NetworkMode::Seoul),
+            Some(RoadKind::MajorRoad)
+        );
+
+        let mut gyeongbu = catalog_item("HIGHWAY", None, None);
+        gyeongbu.seq = 10002;
+        gyeongbu.name = "경부고속도로".to_owned();
+        assert_eq!(
+            catalog_road_kind(&gyeongbu, NetworkMode::Seoul),
+            Some(RoadKind::MajorRoad)
+        );
+        assert_eq!(
+            catalog_road_name(&gyeongbu, NetworkMode::Seoul),
+            "경부간선도로"
+        );
+        assert_eq!(
+            catalog_road_name(&gyeongbu, NetworkMode::National),
+            "경부고속도로"
+        );
+    }
+
+    #[test]
+    fn keeps_complete_seoul_fallback_catalog() {
+        let roads = fallback_road_specs(NetworkMode::Seoul);
+        assert_eq!(roads.len(), 50);
+        assert_eq!(
+            roads
+                .iter()
+                .filter(|road| road.kind == RoadKind::UrbanExpressway)
+                .count(),
+            7
+        );
+        assert_eq!(
+            roads
+                .iter()
+                .filter(|road| road.kind == RoadKind::MajorRoad)
+                .count(),
+            43
+        );
+        assert!(roads.iter().any(|road| road.name == "경부간선도로"));
+        assert!(roads.iter().any(|road| road.name == "가양대교"));
+        assert!(roads.iter().any(|road| road.name == "한강대교"));
+        assert_eq!(
+            catalog_road_number(
+                &catalog_item("ROAD", Some("서울"), None),
+                RoadKind::MajorRoad
+            ),
+            "주요"
+        );
+    }
+
+    #[test]
+    fn clips_extended_naver_roads_to_their_seoul_segments() {
+        assert!(include_traffic_group(NetworkMode::Seoul, 10002, "1000201D"));
+        assert!(!include_traffic_group(
+            NetworkMode::Seoul,
+            10002,
+            "1000202D"
+        ));
+        assert!(!include_traffic_group(
+            NetworkMode::Seoul,
+            40266,
+            "4026601D"
+        ));
+        assert!(include_traffic_group(NetworkMode::Seoul, 40266, "4026602D"));
+        assert!(include_traffic_group(
+            NetworkMode::National,
+            10002,
+            "1000217D"
+        ));
     }
 
     fn section(start: [f64; 2], end: [f64; 2]) -> NaverSection {
